@@ -1,9 +1,11 @@
 import json
 
-from flask import Flask, Blueprint, Response
-from flask import current_app, g
-from flask import abort, redirect, request
+from flask import Blueprint, Response
+from flask import g
+from flask import request
+from flask import url_for
 
+from annotator.atoi import atoi
 from annotator.annotation import Annotation
 
 store = Blueprint('store', __name__)
@@ -17,16 +19,23 @@ def jsonify(obj, *args, **kwargs):
     res = json.dumps(obj, indent=None if request.is_xhr else 2)
     return Response(res, mimetype='application/json', *args, **kwargs)
 
+@store.before_request
+def before_request():
+    user = g.auth.request_user(request)
+    if user is not None:
+        g.user = user
+    elif not hasattr(g, 'user'):
+        g.user = None
+
 @store.after_request
 def after_request(response):
     ac = 'Access-Control-'
 
     response.headers[ac + 'Allow-Origin']      = request.headers.get('origin', '*')
-    response.headers[ac + 'Allow-Credentials'] = 'true'
-    response.headers[ac + 'Expose-Headers']    = 'Location'
+    response.headers[ac + 'Expose-Headers']    = 'Content-Length, Content-Type, Location'
 
     if request.method == 'OPTIONS':
-        response.headers[ac + 'Allow-Headers']  = 'X-Requested-With, Content-Type, X-Annotator-Consumer-Key, X-Annotator-User-Id, X-Annotator-Auth-Token-Issue-Time, X-Annotator-Auth-Token-TTL, X-Annotator-Auth-Token'
+        response.headers[ac + 'Allow-Headers']  = 'Content-Length, Content-Type, X-Annotator-Auth-Token, X-Requested-With'
         response.headers[ac + 'Allow-Methods']  = 'GET, POST, PUT, DELETE, OPTIONS'
         response.headers[ac + 'Max-Age']        = '86400'
 
@@ -35,40 +44,82 @@ def after_request(response):
 # ROOT
 @store.route('/')
 def root():
-    return jsonify("Annotator Store API")
+    return jsonify({
+        'message': "Annotator Store API",
+        'links': {
+            'annotation': {
+                'create': {
+                    'method': 'POST',
+                    'url': url_for('.create_annotation', _external=True),
+                    'query': {
+                        'refresh': {
+                            'type': 'bool',
+                            'desc': "Force an index refresh after create (default: true)"
+                        }
+                    },
+                    'desc': "Create a new annotation"
+                },
+                'read': {
+                    'method': 'GET',
+                    'url': url_for('.read_annotation', id=':id', _external=True),
+                    'desc': "Get an existing annotation"
+                },
+                'update': {
+                    'method': 'PUT',
+                    'url': url_for('.update_annotation', id=':id', _external=True),
+                    'query': {
+                        'refresh': {
+                            'type': 'bool',
+                            'desc': "Force an index refresh after update (default: true)"
+                        }
+                    },
+                    'desc': "Update an existing annotation"
+                },
+                'delete': {
+                    'method': 'DELETE',
+                    'url': url_for('.delete_annotation', id=':id', _external=True),
+                    'desc': "Delete an annotation"
+                }
+            },
+            'search': {
+                'method': 'GET',
+                'url': url_for('.search_annotations', _external=True),
+                'desc': 'Basic search API'
+            },
+            'search_raw': {
+                'method': 'GET/POST',
+                'url': url_for('.search_annotations_raw', _external=True),
+                'desc': 'Advanced search API -- direct access to ElasticSearch. Uses the same API as the ElasticSearch query endpoint.'
+            }
+        }
+    })
 
 # INDEX
 @store.route('/annotations')
 def index():
-    auth_consumer, auth_user = g.auth.request_credentials(request)
-
-    if auth_consumer and auth_user:
-        if not g.auth.verify_request(request):
-            return _failed_auth_response()
-
-        annotations = Annotation.search(_user_id=auth_user, _consumer_key=auth_consumer)
-    else:
-        annotations = Annotation.search()
-
+    annotations = Annotation.search()
     return jsonify(annotations)
 
 # CREATE
 @store.route('/annotations', methods=['POST'])
 def create_annotation():
     # Only registered users can create annotations
-    if not g.auth.verify_request(request):
-        return _failed_auth_response()
+    if g.user is None:
+        return _failed_authz_response('create annotation')
 
-    if request.json:
+    if request.json is not None:
         annotation = Annotation(_filter_input(request.json, CREATE_FILTER_FIELDS))
 
-        auth_consumer, auth_user = g.auth.request_credentials(request)
+        annotation['consumer'] = g.user.consumer.key
+        if _get_annotation_user(annotation) != g.user.id:
+            annotation['user'] = g.user.id
 
-        annotation['consumer'] = auth_consumer
-        if _get_annotation_user(annotation) != auth_user:
-            annotation['user'] = auth_user
+        if hasattr(g, 'after_annotation_create'):
+            annotation.save(refresh=False)
+            g.after_annotation_create(annotation)
 
-        annotation.save()
+        refresh = request.args.get('refresh') != 'false'
+        annotation.save(refresh=refresh)
 
         return jsonify(annotation)
     else:
@@ -98,7 +149,7 @@ def update_annotation(id):
     if failure:
         return failure
 
-    if request.json:
+    if request.json is not None:
         updated = _filter_input(request.json, UPDATE_FILTER_FIELDS)
         updated['id'] = id # use id from URL, regardless of what arrives in JSON payload
 
@@ -108,7 +159,12 @@ def update_annotation(id):
                 return failure
 
         annotation.update(updated)
-        annotation.save()
+
+        if hasattr(g, 'before_annotation_update'):
+            g.before_annotation_update(annotation)
+
+        refresh = request.args.get('refresh') != 'false'
+        annotation.save(refresh=refresh)
 
     return jsonify(annotation)
 
@@ -125,37 +181,30 @@ def delete_annotation(id):
         return failure
 
     annotation.delete()
-    return None, 204
+    return '', 204
 
 # SEARCH
 @store.route('/search')
 def search_annotations():
     kwargs = dict(request.args.items())
 
-    auth_consumer, auth_user = g.auth.request_credentials(request)
-
-    if auth_consumer and auth_user:
-        if not g.auth.verify_request(request):
-            return _failed_auth_response()
-
-        kwargs['_consumer_key'] = auth_consumer
-        kwargs['_user_id'] = auth_user
-    else:
-        # Prevent request forgery
-        kwargs.pop('_consumer_key', None)
-        kwargs.pop('_user_id', None)
-
     if 'offset' in kwargs:
-        kwargs['offset'] = _quiet_int(kwargs['offset'])
+        kwargs['offset'] = atoi(kwargs['offset'])
     if 'limit' in kwargs:
-        kwargs['limit'] = _quiet_int(kwargs['limit'], 20)
+        kwargs['limit'] = atoi(kwargs['limit'], 20)
 
     results = Annotation.search(**kwargs)
     total = Annotation.count(**kwargs)
     return jsonify({
         'total': total,
-        'rows': results,
+        'rows': results
     })
+
+# RAW ES SEARCH
+@store.route('/search_raw', methods=['GET', 'POST'])
+def search_annotations_raw():
+    res = Annotation.search_raw(request)
+    return jsonify(res, status=res.get('status', 200))
 
 def _filter_input(obj, fields):
     for field in fields:
@@ -176,26 +225,13 @@ def _get_annotation_user(ann):
         return user
 
 def _check_action(annotation, action, message=''):
-    consumer, user = g.auth.request_credentials(request)
-
-    if not user or not consumer or not g.authorize(annotation, action, user, consumer):
+    if not g.authorize(annotation, action, g.user):
         return _failed_authz_response(message)
 
-    if user and not g.auth.verify_request(request):
-        return _failed_auth_response()
-
 def _failed_authz_response(msg=''):
+    user = g.user.id if g.user else None
+    consumer = g.user.consumer.key if g.user else None
     return jsonify("Cannot authorize request{0}. Perhaps you're not logged in as "
-                   "a user with appropriate permissions on this annotation?".format(' (' + msg + ')'),
+                   "a user with appropriate permissions on this annotation? "
+                   "(user={user}, consumer={consumer})".format(' (' + msg + ')' if msg else '', user=user, consumer=consumer),
                    status=401)
-
-def _failed_auth_response():
-    return jsonify("Cannot authenticate request. Perhaps you didn't send the "
-                   "X-Annotator-* headers?",
-                   status=401)
-
-def _quiet_int(obj, default=0):
-    try:
-        return int(obj)
-    except ValueError:
-        return default

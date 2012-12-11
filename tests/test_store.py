@@ -1,6 +1,7 @@
 from . import TestCase
 from .helpers import MockUser, MockConsumer
 from nose.tools import *
+from mock import patch
 
 from flask import json, url_for
 
@@ -11,11 +12,11 @@ class TestStore(TestCase):
     def setup(self):
         super(TestStore, self).setup()
 
-        self.consumer = MockConsumer()
         self.user = MockUser()
 
-        token = auth.generate_token(self.consumer, self.user.username)
-        self.headers = auth.headers_for_token(token)
+        payload = {'consumerKey': self.user.consumer.key, 'userId': self.user.id}
+        token = auth.encode_token(payload, self.user.consumer.secret)
+        self.headers = {'x-annotator-auth-token': token}
 
         self.ctx = self.app.test_request_context()
         self.ctx.push()
@@ -24,14 +25,14 @@ class TestStore(TestCase):
         self.ctx.pop()
         super(TestStore, self).teardown()
 
-    def _create_annotation(self, **kwargs):
+    def _create_annotation(self, refresh=True, **kwargs):
         opts = {
-            'user': self.user.username,
-            'consumer': self.consumer.key
+            'user': self.user.id,
+            'consumer': self.user.consumer.key
         }
         opts.update(kwargs)
         ann = Annotation(**opts)
-        ann.save()
+        ann.save(refresh=refresh)
         return ann
 
     def _get_annotation(self, id_):
@@ -48,7 +49,7 @@ class TestStore(TestCase):
         assert headers['Access-Control-Allow-Origin'] == '*', \
             "Did not send the right Access-Control-Allow-Origin header."
 
-        assert headers['Access-Control-Expose-Headers'] == 'Location', \
+        assert headers['Access-Control-Expose-Headers'] == 'Content-Length, Content-Type, Location', \
             "Did not send the right Access-Control-Expose-Headers header."
 
     def test_index(self):
@@ -70,8 +71,8 @@ class TestStore(TestCase):
         assert response.status_code == 200, "response should be 200 OK"
         data = json.loads(response.data)
         assert 'id' in data, "annotation id should be returned in response"
-        assert data['user'] == self.user.username
-        assert data['consumer'] == self.consumer.key
+        assert data['user'] == self.user.id
+        assert data['consumer'] == self.user.consumer.key
 
     def test_create_ignore_created(self):
         payload = json.dumps({'created': 'abc'})
@@ -110,8 +111,28 @@ class TestStore(TestCase):
         data = json.loads(response.data)
         ann = self._get_annotation(data['id'])
 
-        assert ann['user'] == self.user.username, "annotation 'user' field should not be futzable by API"
-        assert ann['consumer'] == self.consumer.key, "annotation 'consumer' field should not be used by API"
+        assert ann['user'] == self.user.id, "annotation 'user' field should not be futzable by API"
+        assert ann['consumer'] == self.user.consumer.key, "annotation 'consumer' field should not be used by API"
+
+    @patch('annotator.store.json')
+    @patch('annotator.store.Annotation')
+    def test_create_refresh(self, ann_mock, json_mock):
+        json_mock.dumps.return_value = "{}"
+        response = self.cli.post('/api/annotations?refresh=true',
+                                 data="{}",
+                                 content_type='application/json',
+                                 headers=self.headers)
+        ann_mock.return_value.save.assert_called_once_with(refresh=True)
+
+    @patch('annotator.store.json')
+    @patch('annotator.store.Annotation')
+    def test_create_disable_refresh(self, ann_mock, json_mock):
+        json_mock.dumps.return_value = "{}"
+        response = self.cli.post('/api/annotations?refresh=false',
+                                 data="{}",
+                                 content_type='application/json',
+                                 headers=self.headers)
+        ann_mock.return_value.save.assert_called_once_with(refresh=False)
 
     def test_read(self):
         kwargs = dict(text=u"Foo", id='123')
@@ -208,8 +229,8 @@ class TestStore(TestCase):
 
         upd = self._get_annotation('123')
 
-        assert_equal(upd['user'], self.user.username, "annotation 'user' field should not be futzable by API")
-        assert_equal(upd['consumer'], self.consumer.key, "annotation 'consumer' field should not be futzable by API")
+        assert_equal(upd['user'], self.user.id, "annotation 'user' field should not be futzable by API")
+        assert_equal(upd['consumer'], self.user.consumer.key, "annotation 'consumer' field should not be futzable by API")
 
 
     def test_delete(self):
@@ -234,8 +255,6 @@ class TestStore(TestCase):
         anno2 = self._create_annotation(uri=uri1, text=uri1 + uri1, user=user2)
         anno3 = self._create_annotation(uri=uri2, text=uri2, user=user)
 
-        es.conn.refresh(timesleep=0.01)
-
         res = self._get_search_results()
         assert_equal(res['total'], 3)
 
@@ -251,7 +270,7 @@ class TestStore(TestCase):
 
     def test_search_limit(self):
         for i in xrange(250):
-            self._create_annotation()
+            self._create_annotation(refresh=False)
 
         es.conn.refresh(timesleep=0.01)
 
@@ -273,7 +292,7 @@ class TestStore(TestCase):
 
     def test_search_offset(self):
         for i in xrange(250):
-            self._create_annotation()
+            self._create_annotation(refresh=False)
 
         es.conn.refresh(timesleep=0.01)
 
@@ -304,29 +323,28 @@ class TestStoreAuthz(TestCase):
     def setup(self):
         super(TestStoreAuthz, self).setup()
 
-        self.consumer = MockConsumer()
         self.user = MockUser() # alice
 
         self.anno_id = '123'
         self.permissions = {
-            'read': [self.user.username, 'bob'],
-            'update': [self.user.username, 'charlie'],
-            'admin': [self.user.username]
+            'read': [self.user.id, 'bob'],
+            'update': [self.user.id, 'charlie'],
+            'admin': [self.user.id]
         }
 
         self.ctx = self.app.test_request_context()
         self.ctx.push()
 
         ann = Annotation(id=self.anno_id,
-                         user=self.user.username,
-                         consumer=self.consumer.key,
+                         user=self.user.id,
+                         consumer=self.user.consumer.key,
                          text='Foobar',
                          permissions=self.permissions)
         ann.save()
 
         for u in ['alice', 'bob', 'charlie']:
-            token = auth.generate_token(self.consumer, u)
-            setattr(self, '%s_headers' % u, auth.headers_for_token(token))
+            token = auth.encode_token({'consumerKey': self.user.consumer.key, 'userId': u}, self.user.consumer.secret)
+            setattr(self, '%s_headers' % u, {'x-annotator-auth-token': token})
 
     def teardown(self):
         self.ctx.pop()
@@ -391,7 +409,7 @@ class TestStoreAuthz(TestCase):
     def test_update_other_users_annotation(self):
         ann = Annotation(id=123,
                          user='foo',
-                         consumer=self.consumer.key,
+                         consumer=self.user.consumer.key,
                          permissions={'update': ['group:__consumer__']})
         ann.save()
 
@@ -406,3 +424,44 @@ class TestStoreAuthz(TestCase):
                                 headers=self.bob_headers)
         assert response.status_code == 200, "response should be 200 OK"
 
+    def test_search_public(self):
+        # Not logged in: no results
+        results = self._get_search_results()
+        assert results['total'] == 0
+        assert results['rows'] == []
+
+    def test_search_authenticated(self):
+        # Logged in as Bob: 1 result
+        results = self._get_search_results(headers=self.bob_headers)
+        assert results['total'] == 1
+        assert results['rows'][0]['id'] == self.anno_id
+
+        # Logged in as Charlie: 0 results
+        results = self._get_search_results(headers=self.charlie_headers)
+        assert results['total'] == 0
+        assert results['rows'] == []
+
+    def test_search_raw_public(self):
+        # Not logged in: no results
+        results = self._get_search_raw_results()
+        assert results['hits']['total'] == 0
+        assert results['hits']['hits'] == []
+
+    def test_search_raw_authorized(self):
+        # Logged in as Bob: 1 result
+        results = self._get_search_raw_results(headers=self.bob_headers)
+        assert results['hits']['total'] == 1
+        assert results['hits']['hits'][0]['_source']['id'] == self.anno_id
+
+        # Logged in as Charlie: 0 results
+        results = self._get_search_raw_results(headers=self.charlie_headers)
+        assert results['hits']['total'] == 0
+        assert results['hits']['hits'] == []
+
+    def _get_search_results(self, qs='', **kwargs):
+        res = self.cli.get('/api/search?{qs}'.format(qs=qs), **kwargs)
+        return json.loads(res.data)
+
+    def _get_search_raw_results(self, qs='', **kwargs):
+        res = self.cli.get('/api/search_raw?{qs}'.format(qs=qs), **kwargs)
+        return json.loads(res.data)

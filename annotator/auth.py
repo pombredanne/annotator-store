@@ -1,92 +1,126 @@
 import datetime
-import hashlib
+import json
+
 import iso8601
+import jwt
 
-HEADER_PREFIX = 'x-annotator-'
+DEFAULT_TTL = 86400
 
-# Yoinked from python docs
-ZERO = datetime.timedelta(0)
-class Utc(datetime.tzinfo):
-    def utcoffset(self, dt):
-        return ZERO
+class Consumer(object):
+    def __init__(self, key):
+        self.key = key
 
-    def tzname(self, dt):
-        return "UTC"
+class User(object):
+    def __init__(self, id, consumer, is_admin):
+        self.id = id
+        self.consumer = consumer
+        self.is_admin = is_admin
 
-    def dst(self, dt):
-        return ZERO
-UTC = Utc()
+    @classmethod
+    def from_token(cls, token):
+        return cls(
+            token['userId'],
+            Consumer(token['consumerKey']),
+            token.get('admin', False)
+        )
 
 class Authenticator(object):
+    """
+    A wrapper around the low-level encode_token() and decode_token() that is
+    backend inspecific, and swallows all possible exceptions thrown by badly-
+    formatted, invalid, or malicious tokens.
+    """
 
     def __init__(self, consumer_fetcher):
+        """
+        Arguments:
+        consumer_fetcher -- a function which takes a consumer key and returns an object
+                            with 'key', 'secret', and 'ttl' attributes
+        """
         self.consumer_fetcher = consumer_fetcher
 
-    def generate_token(self, key, *args):
-        consumer = self.consumer_fetcher(key)
-        return generate_token(consumer, *args)
+    def request_user(self, request):
+        """
+        Retrieve the user object associated with the current request.
 
-    def verify_token(self, key, *args):
-        consumer = self.consumer_fetcher(key)
-        return verify_token(consumer, *args)
+        Arguments:
+        request -- a Flask Request object
 
-    def verify_request(self, request):
-        required = ['consumer-key', 'auth-token', 'user-id', 'auth-token-issue-time']
-        headers  = [HEADER_PREFIX + key for key in required]
+        Returns: a user object
+        """
+        token = self._decode_request_token(request)
 
-        rh = request.headers
+        if token:
+            try:
+                return User.from_token(token)
+            except KeyError:
+                return None
+        else:
+            return None
 
-        # False if not all the required headers have been provided
-        if not set(headers) <= set([key.lower() for key in rh.keys()]):
+    def _decode_request_token(self, request):
+        """
+        Retrieve any request token from the passed request, verify its
+        authenticity and validity, and return the parsed contents of the token
+        if and only if all such checks pass.
+
+        Arguments:
+        request -- a Flask Request object
+        """
+
+        token = request.headers.get('x-annotator-auth-token')
+        if token is None:
             return False
 
-        result = self.verify_token( *[rh[h] for h in headers] )
+        try:
+            unsafe_token = decode_token(token, verify=False)
+        except TokenInvalid: # catch junk tokens
+            return False
 
-        return result
+        key = unsafe_token.get('consumerKey')
+        if not key:
+            return False
 
-    def request_detail(self, request, key, default=None):
-        return request.headers.get(HEADER_PREFIX + key, default)
+        consumer = self.consumer_fetcher(key)
+        if not consumer:
+            return False
 
-    def request_credentials(self, request):
-        return (self.request_detail(request, 'consumer-key'),
-                self.request_detail(request, 'user-id'))
+        try:
+            return decode_token(token, secret=consumer.secret, ttl=consumer.ttl)
+        except TokenInvalid: # catch inauthentic or expired tokens
+            return False
+
+class TokenInvalid(Exception):
+    pass
 
 # Main auth routines
+def encode_token(token, secret):
+    token.update({'issuedAt': _now().isoformat()})
+    return jwt.encode(token, secret)
 
-def generate_token(consumer, user_id):
-    issue_time = datetime.datetime.now(UTC).isoformat()
-    token = hashlib.sha256(consumer.secret + user_id + issue_time).hexdigest()
+def decode_token(token, secret='', ttl=DEFAULT_TTL, verify=True):
+    try:
+        token = jwt.decode(token, secret, verify=verify)
+    except jwt.DecodeError:
+        import sys
+        exc_class, exc, tb = sys.exc_info()
+        new_exc = TokenInvalid("error decoding JSON Web Token: %s" % exc or exc_class)
+        raise new_exc.__class__, new_exc, tb
 
-    return dict(
-        consumerKey=consumer.key,
-        authToken=token,
-        authTokenIssueTime=issue_time,
-        authTokenTTL=consumer.ttl,
-        userId=user_id
-    )
+    if verify:
+        issue_time = token.get('issuedAt')
+        if issue_time is None:
+            raise TokenInvalid("'issuedAt' is missing from token")
 
-def verify_token(consumer, token, user_id, issue_time):
-    computed_token = hashlib.sha256(consumer.secret + user_id + issue_time).hexdigest()
+        issue_time = iso8601.parse_date(issue_time)
+        expiry_time = issue_time + datetime.timedelta(seconds=ttl)
 
-    if computed_token != token:
-        return False # Token inauthentic: computed hash doesn't match.
+        if issue_time > _now():
+            raise TokenInvalid("token is not yet valid")
+        if expiry_time < _now():
+            raise TokenInvalid("token has expired")
 
-    validity = iso8601.parse_date(issue_time)
-    expiry = validity + datetime.timedelta(seconds=consumer.ttl)
+    return token
 
-    if validity > datetime.datetime.now(UTC):
-        return False # Token not yet valid
-
-    if expiry < datetime.datetime.now(UTC):
-        return False # Token expired: issue_time + ttl > now
-
-    return True
-
-def headers_for_token(token):
-    return {
-        HEADER_PREFIX + 'consumer-key': token['consumerKey'],
-        HEADER_PREFIX + 'auth-token': token['authToken'],
-        HEADER_PREFIX + 'auth-token-issue-time': token['authTokenIssueTime'],
-        HEADER_PREFIX + 'auth-token-ttl': token['authTokenTTL'],
-        HEADER_PREFIX + 'user-id': token['userId']
-    }
+def _now():
+    return datetime.datetime.now(iso8601.iso8601.UTC).replace(microsecond=0)

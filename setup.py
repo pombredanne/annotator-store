@@ -1,24 +1,27 @@
 from setuptools import setup, find_packages
+import sys
+
+requires = [
+    'Flask==0.9',
+    'pyes==0.19.1',
+    'PyJWT==0.1.4',
+    'iso8601==0.1.4',
+]
+
+if sys.version_info < (2, 7):
+    requires.append('ordereddict==1.1')
 
 setup(
     name = 'annotator',
-    version = '0.6.3',
+    version = '0.9.1',
     packages = find_packages(),
 
-    install_requires = [
-        'Flask==0.8',
-        'pyes==0.16.0',
-        'nose==1.0.0',
-        'iso8601==0.1.4'
-    ],
+    install_requires = requires,
 
     # metadata for upload to PyPI
     author = 'Rufus Pollock and Nick Stenning (Open Knowledge Foundation)',
     author_email = 'annotator@okfn.org',
-    description = 'Inline web annotation application and middleware using javascript and WSGI',
-    long_description = """Inline javascript-based web annotation library. \
-Package includeds a database-backed annotation store \
-with RESTFul (WSGI-powered) web-interface.""",
+    description = 'Database backend for the Annotator (http://annotateit.org)',
     license = 'MIT',
     keywords = 'annotation web javascript',
 
@@ -26,7 +29,7 @@ with RESTFul (WSGI-powered) web-interface.""",
     download_url = 'https://github.com/okfn/annotator-store',
 
     classifiers = [
-        'Development Status :: 3 - Alpha',
+        'Development Status :: 4 - Beta',
         'Environment :: Console',
         'Intended Audience :: Developers',
         'License :: OSI Approved :: MIT License',
