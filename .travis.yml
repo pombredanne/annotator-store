@@ -6,5 +6,5 @@ python:
 services:
   - elasticsearch
 install:
-  - pip install . --use-mirrors
+  - pip install -e .[testing]
 script: nosetests

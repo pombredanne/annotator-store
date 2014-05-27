@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 run.py: A simple example app for using the Annotator Store blueprint
 
@@ -16,7 +17,7 @@ import os
 import sys
 
 from flask import Flask, g, current_app
-from annotator import es, annotation, auth, authz, store
+from annotator import es, annotation, auth, authz, document, store
 from tests.helpers import MockUser, MockConsumer, MockAuthenticator
 from tests.helpers import mock_authorizer
 
@@ -25,16 +26,24 @@ here = os.path.dirname(__file__)
 def main():
     app = Flask(__name__)
 
+    cfg_file = 'annotator.cfg'
+    if len(sys.argv) == 2:
+        cfg_file = sys.argv[1]
+
+    cfg_path = os.path.join(here, cfg_file)
+
     try:
-        app.config.from_pyfile(os.path.join(here, 'annotator.cfg'))
+        app.config.from_pyfile(cfg_path)
     except IOError:
-        print("Please copy example config from annotator.cfg.example to annotator.cfg", file=sys.stderr)
+        print("Could not find config file %s" % cfg_path, file=sys.stderr)
+        print("Perhaps you need to copy annotator.cfg.example to annotator.cfg", file=sys.stderr)
         sys.exit(1)
 
     es.init_app(app)
 
     with app.test_request_context():
         annotation.Annotation.create_all()
+        document.Document.create_all()
 
     @app.before_request
     def before_request():
