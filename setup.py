@@ -2,10 +2,11 @@ from setuptools import setup, find_packages
 import os
 
 requires = [
-    'Flask==0.9',
-    'elasticsearch',
-    'PyJWT==0.1.4',
-    'iso8601==0.1.4',
+    'Flask>=0.9,<2',
+    'elasticsearch>=1.0,<2',
+    'PyJWT>=0.1.4',
+    'iso8601>=0.1.4',
+    'six',
 ]
 
 def read(*paths):

@@ -4,54 +4,43 @@ import csv
 import json
 import logging
 import datetime
-import urlparse
 
 import iso8601
 
 import elasticsearch
-from flask import current_app
-from flask import _app_ctx_stack as stack
+from six import iteritems
+from six.moves.urllib.parse import urlparse
 from annotator.atoi import atoi
 
 log = logging.getLogger(__name__)
 
 RESULTS_MAX_SIZE = 200
-
+RESULTS_DEFAULT_SIZE = 20
 
 class ElasticSearch(object):
     """
-
     Thin wrapper around an ElasticSearch connection to make connection handling
-    transparent in a Flask application. Usage:
+    more convenient.
 
-        app = Flask(__name__)
-        es = ElasticSearch(app)
-
-    Or, you can bind the object to the application later:
-
-        es = ElasticSearch()
-
-        def create_app():
-            app = Flask(__name__)
-            es.init_app(app)
-            return app
-
+    Settings for the ES host and index name etcetera can still be changed in the
+    corresponding attributes before the connection (self.conn) is used.
     """
 
-    def __init__(self, app=None):
-        if app is not None:
-            self.init_app(app)
+    def __init__(self,
+                 host = 'http://127.0.0.1:9200',
+                 index = 'annotator',
+                 authorization_enabled = False,
+                 compatibility_mode = None):
+        self.host = host
+        self.index = index
+        self.authorization_enabled = authorization_enabled
+        self.compatibility_mode = compatibility_mode
 
         self.Model = make_model(self)
 
-    def init_app(self, app):
-        app.config.setdefault('ELASTICSEARCH_HOST', 'http://127.0.0.1:9200')
-        app.config.setdefault('ELASTICSEARCH_INDEX', app.name)
-        app.config.setdefault('ELASTICSEARCH_COMPATIBILITY_MODE', None)
-
-    def connect(self):
-        host = current_app.config['ELASTICSEARCH_HOST']
-        parsed = urlparse.urlparse(host)
+    def _connect(self):
+        host = self.host
+        parsed = urlparse(host)
 
         connargs = {
           'host': parsed.hostname,
@@ -75,18 +64,9 @@ class ElasticSearch(object):
 
     @property
     def conn(self):
-        ctx = stack.top
-        if not hasattr(ctx, 'elasticsearch'):
-            ctx.elasticsearch = self.connect()
-        return ctx.elasticsearch
-
-    @property
-    def index(self):
-        return current_app.config['ELASTICSEARCH_INDEX']
-
-    @property
-    def compatibility_mode(self):
-        return current_app.config['ELASTICSEARCH_COMPATIBILITY_MODE']
+        if not hasattr(self, '_connection'):
+            self._connection = self._connect()
+        return self._connection
 
 
 class _Model(dict):
@@ -127,16 +107,22 @@ class _Model(dict):
         return cls(doc['_source'], id=id)
 
     @classmethod
-    def _build_query(cls, offset=0, limit=20, **kwargs):
-        return _build_query(offset, limit, kwargs)
+    def _build_query(cls, query=None, offset=None, limit=None, **kwargs):
+        if offset is None:
+            offset = 0
+        if limit is None:
+            limit = RESULTS_DEFAULT_SIZE
+        if query is None:
+            query = {}
+        return _build_query(query, offset, limit)
 
     @classmethod
-    def _build_query_raw(cls, request):
+    def _build_query_raw(cls, request, **kwargs):
         return _build_query_raw(request)
 
     @classmethod
-    def search(cls, **kwargs):
-        q = cls._build_query(**kwargs)
+    def search(cls, query=None, offset=0, limit=RESULTS_DEFAULT_SIZE, **kwargs):
+        q = cls._build_query(query=query, offset=offset, limit=limit, **kwargs)
         if not q:
             return []
         logging.debug("doing search: %s", q)
@@ -147,8 +133,8 @@ class _Model(dict):
         return [cls(d['_source'], id=d['_id']) for d in docs]
 
     @classmethod
-    def search_raw(cls, request):
-        q, params = cls._build_query_raw(request)
+    def search_raw(cls, request, **kwargs):
+        q, params = cls._build_query_raw(request, **kwargs)
         if 'error' in q:
             return q
         try:
@@ -215,16 +201,16 @@ def _csv_split(s, delimiter=','):
     return [r for r in csv.reader([s], delimiter=delimiter)][0]
 
 
-def _build_query(offset, limit, kwds):
+def _build_query(query, offset, limit):
     # Base query is a filtered match_all
     q = {'match_all': {}}
 
-    if kwds:
+    if query:
         f = {'and': []}
         q = {'filtered': {'query': q, 'filter': f}}
 
     # Add a term query for each keyword
-    for k, v in kwds.iteritems():
+    for k, v in iteritems(query):
         q['filtered']['filter']['and'].append({'term': {k: v}})
 
     return {
@@ -240,7 +226,7 @@ def _build_query_raw(request):
     params = {}
 
     if request.method == 'GET':
-        for k, v in request.args.iteritems():
+        for k, v in iteritems(request.args):
             _update_query_raw(query, params, k, v)
 
         if 'query' not in query:
